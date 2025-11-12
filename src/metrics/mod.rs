@@ -1,5 +1,5 @@
 use hdrhistogram::Histogram;
-use hdrhistogram::serialization::{Serializer, V2Serializer};
+use hdrhistogram::serialization::Serializer;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;

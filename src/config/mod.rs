@@ -2,8 +2,10 @@
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Target p95 latency in milliseconds
+    #[allow(dead_code)]
     pub target_p95_ms: u64,
     /// Shadow mode enabled (no real orders)
+    #[allow(dead_code)]
     pub shadow_mode: bool,
     /// Return threshold for triggering (e.g., 5.0 = 5%)
     pub return_threshold_pct: f64,

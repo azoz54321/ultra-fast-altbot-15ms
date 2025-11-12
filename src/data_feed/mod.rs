@@ -20,6 +20,7 @@ impl TradeTick {
     }
 
     /// Get price as f64
+    #[allow(dead_code)]
     pub fn price(&self) -> f64 {
         self.px_e8 as f64 / 1e8
     }

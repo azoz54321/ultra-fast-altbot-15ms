@@ -84,6 +84,7 @@ impl PriceSnapshot {
 #[derive(Debug, Clone, Copy)]
 pub struct TriggerEvent {
     pub symbol_id: u32,
+    #[allow(dead_code)]
     pub ts_unix_ms: u64,
     pub return_pct: f64,
     pub price_e8: u64,
@@ -152,6 +153,7 @@ impl HotPath {
     }
 
     /// Set global can_buy flag
+    #[allow(dead_code)]
     pub fn set_can_buy(&mut self, can_buy: bool) {
         self.can_buy = can_buy;
     }
