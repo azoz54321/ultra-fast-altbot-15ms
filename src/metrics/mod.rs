@@ -1,8 +1,22 @@
 use hdrhistogram::Histogram;
 use hdrhistogram::serialization::Serializer;
+use serde::{Serialize, Deserialize};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
+
+/// Histogram summary for JSON output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistogramSummary {
+    pub count: u64,
+    pub min: u64,
+    pub max: u64,
+    pub p50: u64,
+    pub p95: u64,
+    pub p99: u64,
+    pub p99_9: u64,
+    pub throughput_avg: f64,
+}
 
 /// Metrics collector using HDR histogram for latency tracking
 pub struct MetricsCollector {
@@ -68,6 +82,44 @@ impl MetricsCollector {
 
         file.write_all(&output)
             .map_err(|e| format!("Failed to write histogram: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Generate histogram summary
+    pub fn generate_summary(&self, duration_secs: f64) -> HistogramSummary {
+        let throughput_avg = if duration_secs > 0.0 {
+            self.count() as f64 / duration_secs
+        } else {
+            0.0
+        };
+
+        HistogramSummary {
+            count: self.count(),
+            min: self.histogram.min(),
+            max: self.histogram.max(),
+            p50: self.percentile(0.50),
+            p95: self.percentile(0.95),
+            p99: self.percentile(0.99),
+            p99_9: self.percentile(0.999),
+            throughput_avg,
+        }
+    }
+
+    /// Write histogram summary to JSON file
+    pub fn write_summary_json(&self, path: &Path, duration_secs: f64) -> Result<(), String> {
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory: {}", e))?;
+        }
+
+        let summary = self.generate_summary(duration_secs);
+        let json = serde_json::to_string_pretty(&summary)
+            .map_err(|e| format!("Failed to serialize JSON: {}", e))?;
+
+        fs::write(path, json)
+            .map_err(|e| format!("Failed to write JSON file: {}", e))?;
 
         Ok(())
     }

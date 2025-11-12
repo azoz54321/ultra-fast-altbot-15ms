@@ -28,6 +28,14 @@ struct Args {
     /// Number of symbols to simulate
     #[arg(long, default_value = "300")]
     num_symbols: u32,
+
+    /// Number of symbols per shard (for future sharding support)
+    #[arg(long)]
+    symbols_per_shard: Option<usize>,
+
+    /// Path to write HDR histogram output
+    #[arg(long, default_value = "target/shadow_bench/hdr_histogram.hdr")]
+    hist_out: PathBuf,
 }
 
 fn main() {
@@ -35,7 +43,7 @@ fn main() {
 
     if args.bench_shadow {
         println!("Running in shadow benchmark mode...");
-        run_shadow_benchmark(args.num_ticks, args.num_symbols);
+        run_shadow_benchmark(&args);
     } else {
         println!("Running in normal mode (shadow mode enabled by default)...");
         run_normal_mode();
@@ -43,8 +51,16 @@ fn main() {
 }
 
 /// Run shadow benchmark harness
-fn run_shadow_benchmark(num_ticks: usize, num_symbols: u32) {
+fn run_shadow_benchmark(args: &Args) {
+    let num_ticks = args.num_ticks;
+    let num_symbols = args.num_symbols;
+    
     println!("Generating {} ticks across {} symbols...", num_ticks, num_symbols);
+    
+    if let Some(shard_size) = args.symbols_per_shard {
+        let num_shards = (num_symbols as usize + shard_size - 1) / shard_size;
+        println!("Using {} symbols per shard ({} shards total)", shard_size, num_shards);
+    }
 
     let config = Config::default();
     
@@ -113,9 +129,11 @@ fn run_shadow_benchmark(num_ticks: usize, num_symbols: u32) {
     }
 
     let bench_duration = bench_start.elapsed();
+    let duration_secs = bench_duration.as_secs_f64();
+    
     println!("\n=== Benchmark Complete ===");
-    println!("Total time: {:.2}s", bench_duration.as_secs_f64());
-    println!("Throughput: {:.0} ticks/sec", num_ticks as f64 / bench_duration.as_secs_f64());
+    println!("Total time: {:.2}s", duration_secs);
+    println!("Throughput: {:.0} ticks/sec", num_ticks as f64 / duration_secs);
     println!("Triggers: {}", trigger_count);
     println!();
 
@@ -123,10 +141,16 @@ fn run_shadow_benchmark(num_ticks: usize, num_symbols: u32) {
     metrics.print_summary();
 
     // Write histogram to file
-    let output_path = PathBuf::from("target/shadow_bench/hdr_histogram.hdr");
-    match metrics.write_to_file(&output_path) {
-        Ok(_) => println!("\nHistogram written to: {}", output_path.display()),
+    match metrics.write_to_file(&args.hist_out) {
+        Ok(_) => println!("\nHistogram written to: {}", args.hist_out.display()),
         Err(e) => eprintln!("Failed to write histogram: {}", e),
+    }
+
+    // Write JSON summary
+    let json_path = args.hist_out.with_file_name("histogram_summary.json");
+    match metrics.write_summary_json(&json_path, duration_secs) {
+        Ok(_) => println!("JSON summary written to: {}", json_path.display()),
+        Err(e) => eprintln!("Failed to write JSON summary: {}", e),
     }
 
     println!("\n✓ Shadow benchmark completed successfully");
