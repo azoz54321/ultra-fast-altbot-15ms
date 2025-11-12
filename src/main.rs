@@ -54,24 +54,30 @@ fn main() {
 fn run_shadow_benchmark(args: &Args) {
     let num_ticks = args.num_ticks;
     let num_symbols = args.num_symbols;
-    
-    println!("Generating {} ticks across {} symbols...", num_ticks, num_symbols);
-    
+
+    println!(
+        "Generating {} ticks across {} symbols...",
+        num_ticks, num_symbols
+    );
+
     if let Some(shard_size) = args.symbols_per_shard {
-        let num_shards = (num_symbols as usize + shard_size - 1) / shard_size;
-        println!("Using {} symbols per shard ({} shards total)", shard_size, num_shards);
+        let num_shards = (num_symbols as usize).div_ceil(shard_size);
+        println!(
+            "Using {} symbols per shard ({} shards total)",
+            shard_size, num_shards
+        );
     }
 
     let config = Config::default();
-    
+
     // Generate synthetic ticks
     let generator = TickGenerator::new(num_symbols, num_ticks);
     let ticks = generator.generate();
     println!("Generated {} ticks", ticks.len());
 
     // Create metrics collector
-    let mut metrics = MetricsCollector::new(100_000, 3)
-        .expect("Failed to create metrics collector");
+    let mut metrics =
+        MetricsCollector::new(100_000, 3).expect("Failed to create metrics collector");
 
     // Create hot-path processor
     let hotpath = Arc::new(HotPath::new(
@@ -93,7 +99,7 @@ fn run_shadow_benchmark(args: &Args) {
 
     for (idx, tick) in ticks.iter().enumerate() {
         let mut measurement = LatencyMeasurement::new();
-        
+
         // Start timing
         measurement.start();
 
@@ -130,10 +136,13 @@ fn run_shadow_benchmark(args: &Args) {
 
     let bench_duration = bench_start.elapsed();
     let duration_secs = bench_duration.as_secs_f64();
-    
+
     println!("\n=== Benchmark Complete ===");
     println!("Total time: {:.2}s", duration_secs);
-    println!("Throughput: {:.0} ticks/sec", num_ticks as f64 / duration_secs);
+    println!(
+        "Throughput: {:.0} ticks/sec",
+        num_ticks as f64 / duration_secs
+    );
     println!("Triggers: {}", trigger_count);
     println!();
 
@@ -186,5 +195,36 @@ mod tests {
         let generator = TickGenerator::new(10, 100);
         let ticks = generator.generate();
         assert_eq!(ticks.len(), 100);
+    }
+
+    #[test]
+    fn test_data_feed_hotpath_integration() {
+        use data_feed::DataFeed;
+        use hotpath::HotPath;
+        use std::sync::Arc;
+
+        // Create data feed with SBE decoder
+        let mut feed = DataFeed::new(true, 1000);
+        let rx = feed.get_receiver().unwrap();
+
+        // Create hot path
+        let hotpath = Arc::new(HotPath::new(100, 5.0, 60));
+
+        // Decode some ticks
+        let decoded = feed.decode_and_send(100);
+        assert!(decoded > 0);
+
+        // Process ticks from channel through hot path
+        let mut processed = 0;
+        while let Ok(tick) = rx.try_recv() {
+            // Update snapshot (off hot-path in real system)
+            hotpath.update_snapshot(tick.symbol_id, tick.px_e8, tick.ts_unix_ms);
+
+            // Process on hot path
+            let _trigger = hotpath.process_tick(&tick);
+            processed += 1;
+        }
+
+        assert_eq!(processed, decoded);
     }
 }

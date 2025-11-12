@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
-use arc_swap::ArcSwap;
 use crate::data_feed::TradeTick;
+use arc_swap::ArcSwap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 /// Price snapshot for a symbol (60-second window)
 #[derive(Debug, Clone)]
@@ -32,7 +32,13 @@ impl PriceSnapshot {
     pub fn new(window_secs: u64) -> Self {
         let capacity = (window_secs * 100) as usize; // Assume max 100 ticks/sec
         Self {
-            prices: vec![PricePoint { px_e8: 0, ts_unix_ms: 0 }; capacity],
+            prices: vec![
+                PricePoint {
+                    px_e8: 0,
+                    ts_unix_ms: 0
+                };
+                capacity
+            ],
             write_idx: 0,
             count: 0,
             window_ms: window_secs * 1000,

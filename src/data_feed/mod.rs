@@ -1,3 +1,6 @@
+use crate::sbe_decoder_ffi::SbeDecoderFfi;
+use crossbeam_channel::{bounded, Receiver, Sender};
+
 /// Trade tick data structure with zero-allocation design
 #[derive(Debug, Clone, Copy)]
 pub struct TradeTick {
@@ -34,6 +37,64 @@ pub struct TickGenerator {
     base_prices: Vec<u64>,
 }
 
+/// Data feed manager that can use SBE decoder or synthetic data
+pub struct DataFeed {
+    decoder: Option<SbeDecoderFfi>,
+    tx: Option<Sender<TradeTick>>,
+    rx: Option<Receiver<TradeTick>>,
+}
+
+impl DataFeed {
+    /// Create a new data feed with SPSC channel
+    pub fn new(use_sbe_decoder: bool, channel_capacity: usize) -> Self {
+        let (tx, rx) = bounded(channel_capacity);
+        let decoder = if use_sbe_decoder {
+            Some(SbeDecoderFfi::new())
+        } else {
+            None
+        };
+
+        Self {
+            decoder,
+            tx: Some(tx),
+            rx: Some(rx),
+        }
+    }
+
+    /// Get the receiver end of the channel
+    pub fn get_receiver(&mut self) -> Option<Receiver<TradeTick>> {
+        self.rx.take()
+    }
+
+    /// Decode and send ticks through the channel
+    /// Returns number of ticks decoded
+    pub fn decode_and_send(&mut self, max_ticks: usize) -> usize {
+        if let (Some(decoder), Some(tx)) = (&mut self.decoder, &self.tx) {
+            let mut count = 0;
+            let mut tick = TradeTick::new(0, 0, 0);
+
+            while count < max_ticks {
+                if decoder.decode_into(&mut tick) {
+                    if tx.send(tick).is_err() {
+                        // Channel closed
+                        break;
+                    }
+                    count += 1;
+                } else {
+                    // No more data
+                    break;
+                }
+            }
+
+            count
+        } else {
+            0
+        }
+    }
+}
+
+/// Synthetic tick generator for benchmarking
+
 impl TickGenerator {
     /// Create a new tick generator
     pub fn new(num_symbols: u32, num_ticks: usize) -> Self {
@@ -67,7 +128,7 @@ impl TickGenerator {
             // Generate price variation (-2% to +8% from base, biased upward)
             rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
             let price_var_pct = ((rng_state % 1000) as i64 - 200) as f64 / 100.0;
-            
+
             let base_price = self.base_prices[symbol_id as usize];
             let varied_price = (base_price as f64 * (1.0 + price_var_pct / 100.0)) as u64;
 
@@ -78,5 +139,44 @@ impl TickGenerator {
         }
 
         ticks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_data_feed_with_sbe_decoder() {
+        let mut feed = DataFeed::new(true, 100);
+        let rx = feed.get_receiver().unwrap();
+
+        // Decode some ticks in the background
+        let decoded = feed.decode_and_send(10);
+        assert_eq!(decoded, 10);
+
+        // Receive the ticks
+        let mut received = 0;
+        while let Ok(_tick) = rx.try_recv() {
+            received += 1;
+        }
+        assert_eq!(received, 10);
+    }
+
+    #[test]
+    fn test_data_feed_channel() {
+        let mut feed = DataFeed::new(true, 50);
+        let rx = feed.get_receiver().unwrap();
+
+        // Send ticks through the channel
+        let decoded = feed.decode_and_send(5);
+        assert!(decoded > 0);
+
+        // Verify we can receive
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, decoded);
     }
 }

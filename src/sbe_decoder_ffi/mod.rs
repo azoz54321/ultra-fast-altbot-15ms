@@ -90,11 +90,11 @@ mod tests {
     fn test_sbe_decoder_decode() {
         let mut decoder = SbeDecoderFfi::new();
         let mut tick = TradeTick::new(0, 0, 0);
-        
+
         // Should be able to decode at least one tick (stub returns synthetic data)
         let success = decoder.decode_into(&mut tick);
         assert!(success);
-        
+
         // Check that tick has reasonable values
         assert!(tick.px_e8 > 0);
         assert!(tick.ts_unix_ms > 0);
@@ -103,16 +103,15 @@ mod tests {
     #[test]
     fn test_sbe_decoder_multiple_decodes() {
         let mut decoder = SbeDecoderFfi::new();
-        
+
         // Decode multiple ticks and verify they're different
         let mut tick1 = TradeTick::new(0, 0, 0);
         let mut tick2 = TradeTick::new(0, 0, 0);
-        
+
         assert!(decoder.decode_into(&mut tick1));
         assert!(decoder.decode_into(&mut tick2));
-        
+
         // Ticks should be different (timestamps at minimum)
         assert_ne!(tick1.ts_unix_ms, tick2.ts_unix_ms);
     }
 }
-
