@@ -1,0 +1,21 @@
+[package]
+name = "ultra-fast-altbot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam-channel = "0.5"
+hdrhistogram = "7.5"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+arc-swap = "1.7"
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[[bin]]
+name = "ultra-fast-altbot"
+path = "src/main.rs"

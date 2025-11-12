@@ -1,0 +1,83 @@
+name: Latency Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_ticks:
+        description: 'Number of ticks to generate'
+        required: false
+        default: '100000'
+      num_symbols:
+        description: 'Number of symbols to simulate'
+        required: false
+        default: '300'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+    
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Build (release)
+      run: cargo build --release --verbose
+    
+    - name: Run shadow benchmark
+      run: |
+        ./target/release/ultra-fast-altbot --bench-shadow \
+          --num-ticks ${{ github.event.inputs.num_ticks || '100000' }} \
+          --num-symbols ${{ github.event.inputs.num_symbols || '300' }} \
+          | tee benchmark_output.log
+    
+    - name: Check histogram file
+      run: |
+        test -f target/shadow_bench/hdr_histogram.hdr
+        echo "Histogram file size: $(du -h target/shadow_bench/hdr_histogram.hdr | cut -f1)"
+    
+    - name: Upload benchmark artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results-${{ github.run_number }}
+        path: |
+          benchmark_output.log
+          target/shadow_bench/hdr_histogram.hdr
+        retention-days: 30
+    
+    - name: Display summary
+      run: |
+        echo "### Benchmark Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
+        echo "- Ticks: ${{ github.event.inputs.num_ticks || '100000' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Symbols: ${{ github.event.inputs.num_symbols || '300' }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Results:**" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        tail -n 10 benchmark_output.log >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
