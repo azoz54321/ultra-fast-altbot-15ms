@@ -11,7 +11,12 @@
   - HDR histogram latency tracking (p50/p95/p99)
   - Shadow benchmark harness (100K ticks, 300 symbols)
   - CI pipelines for build/test and latency benchmarking
-- Phase 2: Integer sizing + tick/step rounding + rings 60s/15m/1h خارج المسار الحار.
+- **Phase 2: ✅ COMPLETED** - Hot path deepening, SBE decoder FFI stub, and enhanced metrics
+  - AtomicBool can_buy flag for lock-free risk/market gate updates
+  - Multi-window aggregate rings (15m, 1h) maintained off hot-path
+  - C-based SBE decoder FFI stub with Rust wrapper
+  - Enhanced metrics: JSON output, throughput tracking, moving average logging
+  - Extended CLI flags: --symbols-per-shard, --hist-out
 - Phase 3: Alt Market Gate (AHI).
 - Phase 4: Risk (Slots A/B، freeze، bans).
 - Phase 5: Ops Hardening (reconnect، token-bucket، singleflight، filter refresh).
@@ -41,6 +46,9 @@ cargo run --release -- --bench-shadow
 
 # Custom parameters
 cargo run --release -- --bench-shadow --num-ticks 50000 --num-symbols 100
+
+# Custom output path
+cargo run --release -- --bench-shadow --hist-out /tmp/my_benchmark.hdr
 ```
 
 The benchmark will:
@@ -48,7 +56,8 @@ The benchmark will:
 - Process ticks through the hot-path with latency measurement
 - Record triggers when ret_60s ≥ 5.0%
 - Output p50/p95/p99/p99.9 latency statistics
-- Write HDR histogram to `target/shadow_bench/hdr_histogram.hdr`
+- Write HDR histogram to specified path (default: `target/shadow_bench/hdr_histogram.hdr`)
+- Write JSON summary to same path with .json extension
 
 ### Example Output
 ```
@@ -86,9 +95,9 @@ TradeTick → HotPath.process_tick() → Trigger Decision
 ### Modules
 - **config**: Configuration management (target latency, thresholds)
 - **data_feed**: TradeTick structure and synthetic tick generation
-- **sbe_decoder_ffi**: Placeholder for SBE decoder (future)
-- **hotpath**: Core trigger logic with zero-allocation design
-- **metrics**: HDR histogram latency tracking
+- **sbe_decoder_ffi**: C-based SBE decoder FFI with Rust wrapper (stub implementation)
+- **hotpath**: Core trigger logic with zero-allocation design and multi-window rings
+- **metrics**: HDR histogram latency tracking with JSON output and throughput metrics
 
 ## CI
 

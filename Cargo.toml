@@ -21,6 +21,10 @@ lto = true
 codegen-units = 1
 strip = true
 
+[lib]
+name = "ultra_fast_altbot"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ultra-fast-altbot"
 path = "src/main.rs"

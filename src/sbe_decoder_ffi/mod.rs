@@ -9,6 +9,7 @@ pub struct RawTick {
     pub ts_unix_ms: u64,
 }
 
+#[link(name = "sbe_decoder", kind = "static")]
 extern "C" {
     /// Initialize SBE decoder
     fn sbe_decoder_init() -> i32;
