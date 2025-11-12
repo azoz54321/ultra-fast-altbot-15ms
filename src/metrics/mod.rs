@@ -1,12 +1,28 @@
 use hdrhistogram::Histogram;
 use hdrhistogram::serialization::Serializer;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
+/// JSON summary structure for benchmark results
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MetricsSummary {
+    pub count: u64,
+    pub min: u64,
+    pub max: u64,
+    pub p50: u64,
+    pub p95: u64,
+    pub p99: u64,
+    pub p99_9: u64,
+    pub throughput_avg: f64,
+}
+
 /// Metrics collector using HDR histogram for latency tracking
 pub struct MetricsCollector {
     histogram: Histogram<u64>,
+    tick_count: u64,
+    total_duration_secs: f64,
 }
 
 impl MetricsCollector {
@@ -17,14 +33,24 @@ impl MetricsCollector {
         let histogram = Histogram::new_with_max(max_value, significant_figures)
             .map_err(|e| format!("Failed to create histogram: {}", e))?;
 
-        Ok(Self { histogram })
+        Ok(Self { 
+            histogram,
+            tick_count: 0,
+            total_duration_secs: 0.0,
+        })
     }
 
     /// Record a latency measurement in microseconds (hot-path compatible)
     pub fn record(&mut self, latency_micros: u64) -> Result<(), String> {
+        self.tick_count += 1;
         self.histogram
             .record(latency_micros)
             .map_err(|e| format!("Failed to record latency: {}", e))
+    }
+
+    /// Set total duration for throughput calculation
+    pub fn set_duration(&mut self, duration_secs: f64) {
+        self.total_duration_secs = duration_secs;
     }
 
     /// Get percentile value in microseconds
@@ -37,6 +63,29 @@ impl MetricsCollector {
         self.histogram.len()
     }
 
+    /// Calculate average throughput in ticks/sec
+    pub fn throughput(&self) -> f64 {
+        if self.total_duration_secs > 0.0 {
+            self.tick_count as f64 / self.total_duration_secs
+        } else {
+            0.0
+        }
+    }
+
+    /// Get metrics summary for JSON output
+    pub fn summary(&self) -> MetricsSummary {
+        MetricsSummary {
+            count: self.count(),
+            min: self.histogram.min(),
+            max: self.histogram.max(),
+            p50: self.percentile(0.50),
+            p95: self.percentile(0.95),
+            p99: self.percentile(0.99),
+            p99_9: self.percentile(0.999),
+            throughput_avg: self.throughput(),
+        }
+    }
+
     /// Print summary statistics
     pub fn print_summary(&self) {
         println!("=== Latency Summary ===");
@@ -47,6 +96,9 @@ impl MetricsCollector {
         println!("p99.9: {} µs ({:.2} ms)", self.percentile(0.999), self.percentile(0.999) as f64 / 1000.0);
         println!("max: {} µs ({:.2} ms)", self.histogram.max(), self.histogram.max() as f64 / 1000.0);
         println!("min: {} µs ({:.2} ms)", self.histogram.min(), self.histogram.min() as f64 / 1000.0);
+        if self.total_duration_secs > 0.0 {
+            println!("Throughput: {:.0} ticks/sec", self.throughput());
+        }
     }
 
     /// Write histogram to file in HDR histogram format
@@ -71,6 +123,27 @@ impl MetricsCollector {
 
         Ok(())
     }
+
+    /// Write JSON summary to file
+    pub fn write_json_summary(&self, path: &Path) -> Result<(), String> {
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory: {}", e))?;
+        }
+
+        let summary = self.summary();
+        let json = serde_json::to_string_pretty(&summary)
+            .map_err(|e| format!("Failed to serialize JSON: {}", e))?;
+
+        let mut file = File::create(path)
+            .map_err(|e| format!("Failed to create file: {}", e))?;
+
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("Failed to write JSON: {}", e))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -89,5 +162,18 @@ mod tests {
 
         assert_eq!(collector.count(), 4);
         assert!(collector.percentile(0.5) >= 100);
+    }
+
+    #[test]
+    fn test_metrics_summary() {
+        let mut collector = MetricsCollector::new(100_000, 3).unwrap();
+        collector.record(100).unwrap();
+        collector.record(200).unwrap();
+        collector.set_duration(1.0);
+        
+        let summary = collector.summary();
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.min, 100);
+        assert!(summary.throughput_avg > 0.0);
     }
 }

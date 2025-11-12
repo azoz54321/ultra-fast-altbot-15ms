@@ -28,6 +28,14 @@ struct Args {
     /// Number of symbols to simulate
     #[arg(long, default_value = "300")]
     num_symbols: u32,
+
+    /// Symbols per shard (for future sharding implementation)
+    #[arg(long, default_value = "100")]
+    symbols_per_shard: u32,
+
+    /// Histogram output file path
+    #[arg(long, default_value = "target/shadow_bench/hdr_histogram.hdr")]
+    hist_out: PathBuf,
 }
 
 fn main() {
@@ -35,7 +43,7 @@ fn main() {
 
     if args.bench_shadow {
         println!("Running in shadow benchmark mode...");
-        run_shadow_benchmark(args.num_ticks, args.num_symbols);
+        run_shadow_benchmark(args.num_ticks, args.num_symbols, args.hist_out);
     } else {
         println!("Running in normal mode (shadow mode enabled by default)...");
         run_normal_mode();
@@ -43,7 +51,7 @@ fn main() {
 }
 
 /// Run shadow benchmark harness
-fn run_shadow_benchmark(num_ticks: usize, num_symbols: u32) {
+fn run_shadow_benchmark(num_ticks: usize, num_symbols: u32, hist_out: PathBuf) {
     println!("Generating {} ticks across {} symbols...", num_ticks, num_symbols);
 
     let config = Config::default();
@@ -106,13 +114,20 @@ fn run_shadow_benchmark(num_ticks: usize, num_symbols: u32) {
             eprintln!("Failed to record metric: {}", e);
         }
 
-        // Progress update
+        // Progress update with throughput logging
         if (idx + 1) % 10_000 == 0 {
-            println!("Processed {}/{} ticks...", idx + 1, num_ticks);
+            let elapsed = bench_start.elapsed().as_secs_f64();
+            let throughput = (idx + 1) as f64 / elapsed;
+            println!("Processed {}/{} ticks... (throughput: {:.0} ticks/sec)", 
+                     idx + 1, num_ticks, throughput);
         }
     }
 
     let bench_duration = bench_start.elapsed();
+    
+    // Set duration for throughput calculation
+    metrics.set_duration(bench_duration.as_secs_f64());
+    
     println!("\n=== Benchmark Complete ===");
     println!("Total time: {:.2}s", bench_duration.as_secs_f64());
     println!("Throughput: {:.0} ticks/sec", num_ticks as f64 / bench_duration.as_secs_f64());
@@ -123,10 +138,16 @@ fn run_shadow_benchmark(num_ticks: usize, num_symbols: u32) {
     metrics.print_summary();
 
     // Write histogram to file
-    let output_path = PathBuf::from("target/shadow_bench/hdr_histogram.hdr");
-    match metrics.write_to_file(&output_path) {
-        Ok(_) => println!("\nHistogram written to: {}", output_path.display()),
+    match metrics.write_to_file(&hist_out) {
+        Ok(_) => println!("\nHistogram written to: {}", hist_out.display()),
         Err(e) => eprintln!("Failed to write histogram: {}", e),
+    }
+
+    // Write JSON summary
+    let json_path = hist_out.with_extension("json");
+    match metrics.write_json_summary(&json_path) {
+        Ok(_) => println!("JSON summary written to: {}", json_path.display()),
+        Err(e) => eprintln!("Failed to write JSON summary: {}", e),
     }
 
     println!("\n✓ Shadow benchmark completed successfully");
