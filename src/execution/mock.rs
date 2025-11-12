@@ -87,7 +87,7 @@ impl ExecutionMock {
         fill_delay_us: u64,
     ) -> (Self, Sender<OrderIntent>, Receiver<OrderEvent>) {
         let (intent_tx, intent_rx) = bounded(queue_capacity);
-        let (event_tx, event_rx) = bounded(queue_capacity * 2); // 2x for Ack + Fill
+        let (event_tx, event_rx) = bounded(queue_capacity * 3); // 3x for Submitted + Ack + Fill
 
         let mock = ExecutionMock {
             intent_rx,
@@ -171,8 +171,9 @@ impl ExecutionMock {
                     }
                 }
                 Err(TryRecvError::Empty) => {
-                    // No intents available, continue
-                    // In real implementation, might use blocking recv or async
+                    // No intents available, continue polling
+                    // Note: This is a busy-wait loop. Consider using recv() for blocking
+                    // or adding thread::yield_now() if CPU usage is a concern.
                     continue;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -199,7 +200,7 @@ impl ExecutionMock {
                     processed += 1;
                 }
                 Err(TryRecvError::Empty) => {
-                    // No intents available, continue
+                    // No intents available, continue polling
                     continue;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -208,39 +209,6 @@ impl ExecutionMock {
                 }
             }
         }
-    }
-}
-
-/// Metrics for execution mock
-pub struct ExecutionMetrics {
-    pub submitted: Arc<AtomicU64>,
-    pub acks: Arc<AtomicU64>,
-    pub fills: Arc<AtomicU64>,
-}
-
-impl ExecutionMetrics {
-    pub fn new(
-        submitted: Arc<AtomicU64>,
-        acks: Arc<AtomicU64>,
-        fills: Arc<AtomicU64>,
-    ) -> Self {
-        Self {
-            submitted,
-            acks,
-            fills,
-        }
-    }
-
-    pub fn get_submitted(&self) -> u64 {
-        self.submitted.load(Ordering::Relaxed)
-    }
-
-    pub fn get_acks(&self) -> u64 {
-        self.acks.load(Ordering::Relaxed)
-    }
-
-    pub fn get_fills(&self) -> u64 {
-        self.fills.load(Ordering::Relaxed)
     }
 }
 

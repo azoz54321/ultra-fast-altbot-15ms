@@ -372,8 +372,14 @@ impl HotPath {
     }
 
     /// Decrement open intents counter (called when order completes)
+    /// Uses saturating subtraction to prevent underflow
     pub fn decrement_open_intents(&self) {
-        self.open_intents.fetch_sub(1, Ordering::Relaxed);
+        // Use fetch_max to ensure we don't go below 0
+        let prev = self.open_intents.fetch_sub(1, Ordering::Relaxed);
+        if prev == 0 {
+            // We went negative, add it back
+            self.open_intents.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Replenish budget (called by maintenance task)

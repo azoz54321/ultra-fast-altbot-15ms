@@ -5,6 +5,17 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
+/// Execution metrics for Phase 3
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionMetrics {
+    pub emitted_intents: u64,
+    pub dropped_intents: u64,
+    pub ack_count: u64,
+    pub fill_count: u64,
+    pub gate_block_count: u64,
+    pub cooldown_block_count: u64,
+}
+
 /// Histogram summary for JSON output
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistogramSummary {
@@ -120,12 +131,7 @@ impl MetricsCollector {
     pub fn generate_summary(
         &self,
         duration_secs: f64,
-        emitted_intents: u64,
-        dropped_intents: u64,
-        ack_count: u64,
-        fill_count: u64,
-        gate_block_count: u64,
-        cooldown_block_count: u64,
+        exec_metrics: &ExecutionMetrics,
     ) -> HistogramSummary {
         let throughput_avg = if duration_secs > 0.0 {
             self.count() as f64 / duration_secs
@@ -142,12 +148,12 @@ impl MetricsCollector {
             p99: self.percentile(0.99),
             p99_9: self.percentile(0.999),
             throughput_avg,
-            emitted_intents,
-            dropped_intents,
-            ack_count,
-            fill_count,
-            gate_block_count,
-            cooldown_block_count,
+            emitted_intents: exec_metrics.emitted_intents,
+            dropped_intents: exec_metrics.dropped_intents,
+            ack_count: exec_metrics.ack_count,
+            fill_count: exec_metrics.fill_count,
+            gate_block_count: exec_metrics.gate_block_count,
+            cooldown_block_count: exec_metrics.cooldown_block_count,
         }
     }
 
@@ -156,27 +162,14 @@ impl MetricsCollector {
         &self,
         path: &Path,
         duration_secs: f64,
-        emitted_intents: u64,
-        dropped_intents: u64,
-        ack_count: u64,
-        fill_count: u64,
-        gate_block_count: u64,
-        cooldown_block_count: u64,
+        exec_metrics: &ExecutionMetrics,
     ) -> Result<(), String> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
         }
 
-        let summary = self.generate_summary(
-            duration_secs,
-            emitted_intents,
-            dropped_intents,
-            ack_count,
-            fill_count,
-            gate_block_count,
-            cooldown_block_count,
-        );
+        let summary = self.generate_summary(duration_secs, exec_metrics);
         let json = serde_json::to_string_pretty(&summary)
             .map_err(|e| format!("Failed to serialize JSON: {}", e))?;
 
@@ -192,12 +185,7 @@ impl MetricsCollector {
         duration_secs: f64,
         num_ticks: usize,
         trigger_count: usize,
-        emitted_intents: u64,
-        dropped_intents: u64,
-        ack_count: u64,
-        fill_count: u64,
-        gate_block_count: u64,
-        cooldown_block_count: u64,
+        exec_metrics: &ExecutionMetrics,
     ) -> Result<(), String> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
@@ -231,15 +219,15 @@ impl MetricsCollector {
         output.push_str(&format!("  min:  {} µs ({:.2} ms)\n\n", self.histogram.min(), self.histogram.min() as f64 / 1000.0));
 
         output.push_str("=== Execution Mock Metrics ===\n");
-        output.push_str(&format!("  Emitted Intents: {}\n", emitted_intents));
-        output.push_str(&format!("  Dropped Intents: {}\n", dropped_intents));
-        output.push_str(&format!("  Acks Received: {}\n", ack_count));
-        output.push_str(&format!("  Fills Received: {}\n", fill_count));
-        output.push_str(&format!("  Gate Blocks: {}\n", gate_block_count));
-        output.push_str(&format!("  Cooldown Blocks: {}\n\n", cooldown_block_count));
+        output.push_str(&format!("  Emitted Intents: {}\n", exec_metrics.emitted_intents));
+        output.push_str(&format!("  Dropped Intents: {}\n", exec_metrics.dropped_intents));
+        output.push_str(&format!("  Acks Received: {}\n", exec_metrics.ack_count));
+        output.push_str(&format!("  Fills Received: {}\n", exec_metrics.fill_count));
+        output.push_str(&format!("  Gate Blocks: {}\n", exec_metrics.gate_block_count));
+        output.push_str(&format!("  Cooldown Blocks: {}\n\n", exec_metrics.cooldown_block_count));
 
         output.push_str("=== Consistency Check ===\n");
-        let consistency = if fill_count <= ack_count && ack_count <= emitted_intents {
+        let consistency = if exec_metrics.fill_count <= exec_metrics.ack_count && exec_metrics.ack_count <= exec_metrics.emitted_intents {
             "✓ PASS (fills <= acks <= emitted_intents)"
         } else {
             "✗ FAIL (inconsistent metrics)"

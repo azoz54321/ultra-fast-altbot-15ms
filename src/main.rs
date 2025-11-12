@@ -9,7 +9,7 @@ use clap::Parser;
 use config::Config;
 use data_feed::TickGenerator;
 use hotpath::{HotPath, LatencyMeasurement};
-use metrics::MetricsCollector;
+use metrics::{ExecutionMetrics, MetricsCollector};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -87,7 +87,7 @@ fn run_shadow_benchmark(args: &Args) {
     // Create execution mock with SPSC channel
     // Queue capacity: 1000 intents, Ack delay: 50us, Fill delay: 100us
     let (exec_mock, intent_tx, event_rx) = ExecutionMock::new(1000, 50, 100);
-    let (submitted_counter, ack_counter, fill_counter) = exec_mock.get_counters();
+    let (_submitted_counter, ack_counter, fill_counter) = exec_mock.get_counters();
 
     // Spawn execution mock thread (off hot-path)
     let exec_handle = thread::spawn(move || {
@@ -117,22 +117,19 @@ fn run_shadow_benchmark(args: &Args) {
     let hotpath_clone = Arc::new(hotpath);
     let hotpath_for_events = Arc::clone(&hotpath_clone);
     let event_handle = thread::spawn(move || {
-        let mut events_consumed = 0;
         loop {
             match event_rx.try_recv() {
                 Ok(event) => {
-                    events_consumed += 1;
                     // Decrement open_intents when we receive a Fill event
                     if matches!(event.kind, execution::OrderEventKind::Fill) {
                         hotpath_for_events.decrement_open_intents();
                     }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
-                    // No events, continue
-                    if events_consumed > 0 && submitted_counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                        // Give some time for events to arrive
-                        thread::sleep(std::time::Duration::from_micros(100));
-                    }
+                    // No events, continue polling
+                    // Note: This is a busy-wait. Consider adding thread::yield_now()
+                    // or a small sleep if CPU usage is a concern in production.
+                    continue;
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     // Channel closed
@@ -190,8 +187,8 @@ fn run_shadow_benchmark(args: &Args) {
     // Drop intent sender to signal completion
     drop(intent_tx);
 
-    // Wait a bit for execution mock to process remaining intents
-    thread::sleep(std::time::Duration::from_millis(100));
+    // Wait briefly for execution mock to process remaining intents
+    thread::sleep(std::time::Duration::from_millis(200));
 
     // Get gate metrics
     let gate_metrics = hotpath_clone.get_gate_metrics();
@@ -234,18 +231,19 @@ fn run_shadow_benchmark(args: &Args) {
         Err(e) => eprintln!("Failed to write histogram: {}", e),
     }
 
-    // Write JSON summary with execution metrics
-    let json_path = args.hist_out.with_file_name("histogram_summary.json");
-    match metrics.write_summary_json(
-        &json_path,
-        duration_secs,
-        gate_metrics.emitted_intents,
-        gate_metrics.dropped_intents,
+    // Create execution metrics struct
+    let exec_metrics = ExecutionMetrics {
+        emitted_intents: gate_metrics.emitted_intents,
+        dropped_intents: gate_metrics.dropped_intents,
         ack_count,
         fill_count,
-        gate_metrics.gate_block_count,
-        gate_metrics.cooldown_block_count,
-    ) {
+        gate_block_count: gate_metrics.gate_block_count,
+        cooldown_block_count: gate_metrics.cooldown_block_count,
+    };
+
+    // Write JSON summary with execution metrics
+    let json_path = args.hist_out.with_file_name("histogram_summary.json");
+    match metrics.write_summary_json(&json_path, duration_secs, &exec_metrics) {
         Ok(_) => println!("JSON summary written to: {}", json_path.display()),
         Err(e) => eprintln!("Failed to write JSON summary: {}", e),
     }
@@ -257,12 +255,7 @@ fn run_shadow_benchmark(args: &Args) {
         duration_secs,
         num_ticks,
         trigger_count,
-        gate_metrics.emitted_intents,
-        gate_metrics.dropped_intents,
-        ack_count,
-        fill_count,
-        gate_metrics.gate_block_count,
-        gate_metrics.cooldown_block_count,
+        &exec_metrics,
     ) {
         Ok(_) => println!("Text summary written to: {}", txt_path.display()),
         Err(e) => eprintln!("Failed to write text summary: {}", e),
@@ -270,9 +263,13 @@ fn run_shadow_benchmark(args: &Args) {
 
     println!("\n✓ Shadow benchmark completed successfully");
     
-    // Wait for threads to complete
-    let _ = event_handle.join();
-    let _ = exec_handle.join();
+    // Wait for threads to complete and handle panics
+    if let Err(e) = event_handle.join() {
+        eprintln!("Event consumer thread panicked: {:?}", e);
+    }
+    if let Err(e) = exec_handle.join() {
+        eprintln!("Execution mock thread panicked: {:?}", e);
+    }
 
     std::process::exit(0);
 }
