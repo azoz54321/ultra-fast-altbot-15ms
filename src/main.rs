@@ -1,5 +1,6 @@
 mod config;
 mod data_feed;
+mod execution;
 mod hotpath;
 mod metrics;
 mod sbe_decoder_ffi;
@@ -8,7 +9,7 @@ use clap::Parser;
 use config::Config;
 use data_feed::TickGenerator;
 use hotpath::{HotPath, LatencyMeasurement};
-use metrics::MetricsCollector;
+use metrics::{ExecutionMetrics, MetricsCollector};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -52,6 +53,9 @@ fn main() {
 
 /// Run shadow benchmark harness
 fn run_shadow_benchmark(args: &Args) {
+    use execution::ExecutionMock;
+    use std::thread;
+
     let num_ticks = args.num_ticks;
     let num_symbols = args.num_symbols;
 
@@ -70,7 +74,8 @@ fn run_shadow_benchmark(args: &Args) {
 
     let config = Config::default();
 
-    // Generate synthetic ticks
+    // Generate synthetic ticks with enhanced realism
+    println!("Generating synthetic ticks with variable rates and micro-bursts...");
     let generator = TickGenerator::new(num_symbols, num_ticks);
     let ticks = generator.generate();
     println!("Generated {} ticks", ticks.len());
@@ -79,18 +84,60 @@ fn run_shadow_benchmark(args: &Args) {
     let mut metrics =
         MetricsCollector::new(100_000, 3).expect("Failed to create metrics collector");
 
-    // Create hot-path processor
-    let hotpath = Arc::new(HotPath::new(
+    // Create execution mock with SPSC channel
+    // Queue capacity: 1000 intents, Ack delay: 50us, Fill delay: 100us
+    let (exec_mock, intent_tx, event_rx) = ExecutionMock::new(1000, 50, 100);
+    let (_submitted_counter, ack_counter, fill_counter) = exec_mock.get_counters();
+
+    // Spawn execution mock thread (off hot-path)
+    let exec_handle = thread::spawn(move || {
+        exec_mock.run();
+    });
+
+    // Create hot-path processor with gates and cooldowns
+    let mut hotpath = HotPath::with_config(
         config.max_symbols,
         config.return_threshold_pct,
         config.price_window_secs,
-    ));
+        10,   // max_open_intents
+        500,  // cooldown_ms
+        1000, // initial_budget
+    );
+
+    // Set intent sender for hot path
+    hotpath.set_intent_sender(intent_tx.clone());
 
     // Pre-populate price snapshots to ensure we have history for return calculation
     println!("Pre-populating price snapshots...");
     for tick in ticks.iter().take(1000) {
         hotpath.update_snapshot(tick.symbol_id, tick.px_e8, tick.ts_unix_ms);
     }
+
+    // Spawn thread to consume order events and decrement open_intents on fills
+    let hotpath_clone = Arc::new(hotpath);
+    let hotpath_for_events = Arc::clone(&hotpath_clone);
+    let event_handle = thread::spawn(move || {
+        loop {
+            match event_rx.try_recv() {
+                Ok(event) => {
+                    // Decrement open_intents when we receive a Fill event
+                    if matches!(event.kind, execution::OrderEventKind::Fill) {
+                        hotpath_for_events.decrement_open_intents();
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    // No events, continue polling
+                    // Note: This is a busy-wait. Consider adding thread::yield_now()
+                    // or a small sleep if CPU usage is a concern in production.
+                    continue;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // Channel closed
+                    break;
+                }
+            }
+        }
+    });
 
     // Process ticks and measure latency
     println!("Processing ticks...");
@@ -104,10 +151,10 @@ fn run_shadow_benchmark(args: &Args) {
         measurement.start();
 
         // Update snapshot (in real system, this happens off hot-path)
-        hotpath.update_snapshot(tick.symbol_id, tick.px_e8, tick.ts_unix_ms);
+        hotpath_clone.update_snapshot(tick.symbol_id, tick.px_e8, tick.ts_unix_ms);
 
-        // Process tick on hot-path
-        if let Some(trigger) = hotpath.process_tick(tick) {
+        // Process tick on hot-path (may emit OrderIntent)
+        if let Some(trigger) = hotpath_clone.process_tick(tick) {
             trigger_count += 1;
             if trigger_count <= 10 {
                 println!(
@@ -137,6 +184,17 @@ fn run_shadow_benchmark(args: &Args) {
     let bench_duration = bench_start.elapsed();
     let duration_secs = bench_duration.as_secs_f64();
 
+    // Drop intent sender to signal completion
+    drop(intent_tx);
+
+    // Wait briefly for execution mock to process remaining intents
+    thread::sleep(std::time::Duration::from_millis(200));
+
+    // Get gate metrics
+    let gate_metrics = hotpath_clone.get_gate_metrics();
+    let ack_count = ack_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let fill_count = fill_counter.load(std::sync::atomic::Ordering::Relaxed);
+
     println!("\n=== Benchmark Complete ===");
     println!("Total time: {:.2}s", duration_secs);
     println!(
@@ -144,10 +202,28 @@ fn run_shadow_benchmark(args: &Args) {
         num_ticks as f64 / duration_secs
     );
     println!("Triggers: {}", trigger_count);
+    println!("\n=== Execution Mock Stats ===");
+    println!("Emitted Intents: {}", gate_metrics.emitted_intents);
+    println!("Dropped Intents: {}", gate_metrics.dropped_intents);
+    println!("Acks Received: {}", ack_count);
+    println!("Fills Received: {}", fill_count);
+    println!("Gate Blocks: {}", gate_metrics.gate_block_count);
+    println!("Cooldown Blocks: {}", gate_metrics.cooldown_block_count);
     println!();
 
     // Print metrics summary
     metrics.print_summary();
+
+    // Soft gating check
+    let p95_us = metrics.percentile(0.95);
+    let p95_ms = p95_us as f64 / 1000.0;
+    println!("\n=== Soft Gating Check ===");
+    if p95_us <= 15000 {
+        println!("✓ PASS: p95 latency ({:.2} ms) <= 15.00 ms target", p95_ms);
+    } else {
+        println!("⚠ WARN: p95 latency ({:.2} ms) > 15.00 ms target", p95_ms);
+        println!("(benchmark exits 0 for non-failing gate)");
+    }
 
     // Write histogram to file
     match metrics.write_to_file(&args.hist_out) {
@@ -155,14 +231,46 @@ fn run_shadow_benchmark(args: &Args) {
         Err(e) => eprintln!("Failed to write histogram: {}", e),
     }
 
-    // Write JSON summary
+    // Create execution metrics struct
+    let exec_metrics = ExecutionMetrics {
+        emitted_intents: gate_metrics.emitted_intents,
+        dropped_intents: gate_metrics.dropped_intents,
+        ack_count,
+        fill_count,
+        gate_block_count: gate_metrics.gate_block_count,
+        cooldown_block_count: gate_metrics.cooldown_block_count,
+    };
+
+    // Write JSON summary with execution metrics
     let json_path = args.hist_out.with_file_name("histogram_summary.json");
-    match metrics.write_summary_json(&json_path, duration_secs) {
+    match metrics.write_summary_json(&json_path, duration_secs, &exec_metrics) {
         Ok(_) => println!("JSON summary written to: {}", json_path.display()),
         Err(e) => eprintln!("Failed to write JSON summary: {}", e),
     }
 
+    // Write text summary
+    let txt_path = args.hist_out.with_file_name("summary.txt");
+    match metrics.write_text_summary(
+        &txt_path,
+        duration_secs,
+        num_ticks,
+        trigger_count,
+        &exec_metrics,
+    ) {
+        Ok(_) => println!("Text summary written to: {}", txt_path.display()),
+        Err(e) => eprintln!("Failed to write text summary: {}", e),
+    }
+
     println!("\n✓ Shadow benchmark completed successfully");
+    
+    // Wait for threads to complete and handle panics
+    if let Err(e) = event_handle.join() {
+        eprintln!("Event consumer thread panicked: {:?}", e);
+    }
+    if let Err(e) = exec_handle.join() {
+        eprintln!("Execution mock thread panicked: {:?}", e);
+    }
+
     std::process::exit(0);
 }
 

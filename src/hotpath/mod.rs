@@ -1,6 +1,8 @@
 use crate::data_feed::TradeTick;
+use crate::execution::{OrderIntent, OrderSide};
 use arc_swap::ArcSwap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crossbeam_channel::Sender;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -161,7 +163,7 @@ pub struct TriggerEvent {
     pub price_e8: u64,
 }
 
-/// Hot-path processor for tick-to-trigger logic
+/// Hot-path processor for tick-to-trigger logic with execution wiring
 pub struct HotPath {
     /// Global flag to enable/disable buying (atomic for lock-free access)
     can_buy: Arc<AtomicBool>,
@@ -171,13 +173,49 @@ pub struct HotPath {
     snapshots: Vec<ArcSwap<PriceSnapshot>>,
     /// Maximum symbols
     max_symbols: usize,
+    /// Maximum open intents (gate)
+    max_open_intents: Arc<AtomicU32>,
+    /// Current open intents counter
+    open_intents: Arc<AtomicU32>,
+    /// Budget counter (decrements on emit, replenished by maintenance)
+    budget: Arc<AtomicU64>,
+    /// Per-symbol cooldown timestamps (last trigger time in ms)
+    cooldowns: Vec<AtomicU64>,
+    /// Cooldown duration in milliseconds
+    cooldown_ms: u64,
+    /// Optional sender for order intents
+    intent_tx: Option<Sender<OrderIntent>>,
+    /// Dropped intents counter
+    dropped_intents: Arc<AtomicU64>,
+    /// Emitted intents counter
+    emitted_intents: Arc<AtomicU64>,
+    /// Gate block counter
+    gate_block_count: Arc<AtomicU64>,
+    /// Cooldown block counter
+    cooldown_block_count: Arc<AtomicU64>,
 }
 
 impl HotPath {
     /// Create a new hot-path processor
     pub fn new(max_symbols: usize, threshold_pct: f64, window_secs: u64) -> Self {
+        Self::with_config(max_symbols, threshold_pct, window_secs, 10, 500, 1000)
+    }
+
+    /// Create with custom configuration
+    pub fn with_config(
+        max_symbols: usize,
+        threshold_pct: f64,
+        window_secs: u64,
+        max_open_intents: u32,
+        cooldown_ms: u64,
+        initial_budget: u64,
+    ) -> Self {
         let snapshots: Vec<ArcSwap<PriceSnapshot>> = (0..max_symbols)
             .map(|_| ArcSwap::new(Arc::new(PriceSnapshot::new(window_secs))))
+            .collect();
+
+        let cooldowns: Vec<AtomicU64> = (0..max_symbols)
+            .map(|_| AtomicU64::new(0))
             .collect();
 
         Self {
@@ -185,6 +223,16 @@ impl HotPath {
             threshold_pct,
             snapshots,
             max_symbols,
+            max_open_intents: Arc::new(AtomicU32::new(max_open_intents)),
+            open_intents: Arc::new(AtomicU32::new(0)),
+            budget: Arc::new(AtomicU64::new(initial_budget)),
+            cooldowns,
+            cooldown_ms,
+            intent_tx: None,
+            dropped_intents: Arc::new(AtomicU64::new(0)),
+            emitted_intents: Arc::new(AtomicU64::new(0)),
+            gate_block_count: Arc::new(AtomicU64::new(0)),
+            cooldown_block_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -199,6 +247,7 @@ impl HotPath {
     }
 
     /// Process a tick on the hot-path (zero allocations, single-threaded)
+    /// Returns TriggerEvent if conditions met, and optionally emits OrderIntent
     pub fn process_tick(&self, tick: &TradeTick) -> Option<TriggerEvent> {
         // Check can_buy flag (atomic load, relaxed ordering for performance)
         if !self.can_buy.load(Ordering::Relaxed) || (tick.symbol_id as usize) >= self.max_symbols {
@@ -212,6 +261,9 @@ impl HotPath {
         if let Some(ret_60s) = snapshot.compute_return_60s(tick.ts_unix_ms) {
             // Check trigger condition
             if ret_60s >= self.threshold_pct {
+                // Try to emit order intent (with gates and cooldowns)
+                self.try_emit_intent(tick);
+
                 return Some(TriggerEvent {
                     symbol_id: tick.symbol_id,
                     ts_unix_ms: tick.ts_unix_ms,
@@ -222,6 +274,65 @@ impl HotPath {
         }
 
         None
+    }
+
+    /// Try to emit order intent (with gates, cooldowns, budget checks)
+    fn try_emit_intent(&self, tick: &TradeTick) {
+        // If no intent sender, skip
+        let intent_tx = match &self.intent_tx {
+            Some(tx) => tx,
+            None => return,
+        };
+
+        let symbol_idx = tick.symbol_id as usize;
+        if symbol_idx >= self.max_symbols {
+            return;
+        }
+
+        // Check cooldown for this symbol
+        let last_trigger = self.cooldowns[symbol_idx].load(Ordering::Relaxed);
+        if tick.ts_unix_ms < last_trigger + self.cooldown_ms {
+            self.cooldown_block_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Check budget
+        let budget = self.budget.load(Ordering::Relaxed);
+        if budget == 0 {
+            self.gate_block_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Check max open intents
+        let open = self.open_intents.load(Ordering::Relaxed);
+        let max_open = self.max_open_intents.load(Ordering::Relaxed);
+        if open >= max_open {
+            self.gate_block_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Create order intent
+        let intent = OrderIntent::new(
+            tick.symbol_id,
+            OrderSide::Buy,
+            tick.px_e8,
+            tick.ts_unix_ms,
+        );
+
+        // Try to send (non-blocking)
+        match intent_tx.try_send(intent) {
+            Ok(_) => {
+                // Success: update counters and cooldown
+                self.emitted_intents.fetch_add(1, Ordering::Relaxed);
+                self.open_intents.fetch_add(1, Ordering::Relaxed);
+                self.budget.fetch_sub(1, Ordering::Relaxed);
+                self.cooldowns[symbol_idx].store(tick.ts_unix_ms, Ordering::Relaxed);
+            }
+            Err(_) => {
+                // Queue full: drop and record
+                self.dropped_intents.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Set global can_buy flag (atomic store, can be called from risk/gate task)
@@ -244,6 +355,52 @@ impl HotPath {
             self.snapshots[symbol_id as usize].store(Arc::new(new_snapshot));
         }
     }
+
+    /// Set the order intent sender (must be called before processing ticks that emit intents)
+    pub fn set_intent_sender(&mut self, sender: Sender<OrderIntent>) {
+        self.intent_tx = Some(sender);
+    }
+
+    /// Get gate metrics (for reporting)
+    pub fn get_gate_metrics(&self) -> GateMetrics {
+        GateMetrics {
+            emitted_intents: self.emitted_intents.load(Ordering::Relaxed),
+            dropped_intents: self.dropped_intents.load(Ordering::Relaxed),
+            gate_block_count: self.gate_block_count.load(Ordering::Relaxed),
+            cooldown_block_count: self.cooldown_block_count.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Decrement open intents counter (called when order completes)
+    /// Uses saturating subtraction to prevent underflow
+    pub fn decrement_open_intents(&self) {
+        // Use fetch_max to ensure we don't go below 0
+        let prev = self.open_intents.fetch_sub(1, Ordering::Relaxed);
+        if prev == 0 {
+            // We went negative, add it back
+            self.open_intents.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Replenish budget (called by maintenance task)
+    pub fn replenish_budget(&self, amount: u64) {
+        self.budget.fetch_add(amount, Ordering::Relaxed);
+    }
+
+    /// Get current budget
+    #[allow(dead_code)]
+    pub fn get_budget(&self) -> u64 {
+        self.budget.load(Ordering::Relaxed)
+    }
+}
+
+/// Gate metrics for reporting
+#[derive(Debug, Clone, Copy)]
+pub struct GateMetrics {
+    pub emitted_intents: u64,
+    pub dropped_intents: u64,
+    pub gate_block_count: u64,
+    pub cooldown_block_count: u64,
 }
 
 /// Latency measurement for a single tick processing
