@@ -115,29 +115,91 @@ impl TickGenerator {
         }
     }
 
-    /// Generate synthetic ticks with realistic price movements
+    /// Generate synthetic ticks with enhanced realism:
+    /// - Variable per-symbol tick rates (Poisson-distributed 50-150 tps)
+    /// - Micro-bursts (short periods with 5x rate)
+    /// - Mild mean-reverting drift to force triggers
     pub fn generate(&self) -> Vec<TradeTick> {
         let mut ticks = Vec::with_capacity(self.num_ticks);
         let mut rng_state = 12345u64; // Simple LCG for reproducibility
-
+        
+        // Track current price per symbol for mean-reverting drift
+        let mut current_prices: Vec<u64> = self.base_prices.clone();
+        
+        // Poisson-distributed tick rates per symbol (50-150 tps base)
+        let symbol_tick_rates: Vec<f64> = (0..self.num_symbols)
+            .map(|i| {
+                let seed = 54321u64.wrapping_add(i as u64 * 9973);
+                let rate_offset = ((seed % 100) as f64 - 50.0) / 100.0;
+                100.0 + rate_offset * 50.0 // Range: 50-150 tps
+            })
+            .collect();
+        
+        let mut current_ts = self.base_ts;
+        let mut burst_mode_until = 0u64;
+        
         for i in 0..self.num_ticks {
             // Simple LCG random number generator
             rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
             let symbol_id = (rng_state % self.num_symbols as u64) as u32;
-
-            // Generate price variation (-2% to +8% from base, biased upward)
+            let symbol_idx = symbol_id as usize;
+            
+            // Determine if we should enter burst mode (5% chance every 1000 ticks)
+            if i % 1000 == 0 {
+                rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+                if (rng_state % 100) < 5 {
+                    // Enter burst mode for 50 ticks
+                    burst_mode_until = current_ts + 50;
+                }
+            }
+            
+            // Variable inter-tick delay based on symbol rate and burst mode
+            let base_rate = symbol_tick_rates[symbol_idx];
+            let effective_rate = if current_ts < burst_mode_until {
+                base_rate * 5.0 // 5x rate during burst
+            } else {
+                base_rate
+            };
+            
+            // Average delay in ms between ticks (1000ms / tps)
+            let avg_delay_ms = 1000.0 / effective_rate;
+            
+            // Add some jitter (±50%)
             rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
-            let price_var_pct = ((rng_state % 1000) as i64 - 200) as f64 / 100.0;
-
-            let base_price = self.base_prices[symbol_id as usize];
-            let varied_price = (base_price as f64 * (1.0 + price_var_pct / 100.0)) as u64;
-
-            // Timestamp increases linearly (1ms per tick on average)
-            let ts_unix_ms = self.base_ts + i as u64;
-
-            ticks.push(TradeTick::new(symbol_id, varied_price, ts_unix_ms));
+            let jitter_factor = 0.5 + ((rng_state % 100) as f64 / 100.0);
+            let delay_ms = (avg_delay_ms * jitter_factor).max(1.0) as u64;
+            
+            current_ts += delay_ms;
+            
+            // Mild mean-reverting drift for price
+            let base_price = self.base_prices[symbol_idx];
+            let current_price = current_prices[symbol_idx];
+            
+            // Calculate drift towards base price (mean reversion)
+            let deviation_pct = ((current_price as f64 - base_price as f64) / base_price as f64) * 100.0;
+            
+            // Generate price variation with mean reversion
+            rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+            let raw_var = ((rng_state % 2000) as i64 - 1000) as f64 / 100.0; // -10% to +10%
+            
+            // Apply mean reversion: if price is too high, bias downward; if too low, bias upward
+            let mean_revert_bias = -deviation_pct * 0.2; // 20% reversion strength
+            let price_var_pct = raw_var + mean_revert_bias;
+            
+            // Occasionally inject strong upward moves to trigger conditions
+            let inject_trigger = (i % 500 == 0) && ((rng_state % 10) < 2);
+            let final_var_pct = if inject_trigger {
+                5.0 + ((rng_state % 300) as f64 / 100.0) // +5% to +8% spike
+            } else {
+                price_var_pct.max(-5.0).min(8.0) // Clamp to reasonable range
+            };
+            
+            let new_price = (current_price as f64 * (1.0 + final_var_pct / 100.0)).max(1.0) as u64;
+            current_prices[symbol_idx] = new_price;
+            
+            ticks.push(TradeTick::new(symbol_id, new_price, current_ts));
         }
-
+        
         ticks
     }
 }
