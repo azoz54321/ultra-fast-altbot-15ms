@@ -56,12 +56,22 @@ jobs:
         ./target/release/ultra-fast-altbot --bench-shadow \
           --num-ticks ${{ github.event.inputs.num_ticks || '100000' }} \
           --num-symbols ${{ github.event.inputs.num_symbols || '300' }} \
+          --hist-out target/shadow_bench/hdr_histogram.hdr \
           | tee benchmark_output.log
     
     - name: Check histogram file
       run: |
         test -f target/shadow_bench/hdr_histogram.hdr
         echo "Histogram file size: $(du -h target/shadow_bench/hdr_histogram.hdr | cut -f1)"
+        test -f target/shadow_bench/histogram_summary.json
+        echo "JSON summary file size: $(du -h target/shadow_bench/histogram_summary.json | cut -f1)"
+    
+    - name: Display JSON summary
+      run: |
+        echo "### JSON Summary" >> $GITHUB_STEP_SUMMARY
+        echo '```json' >> $GITHUB_STEP_SUMMARY
+        cat target/shadow_bench/histogram_summary.json >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
     
     - name: Upload benchmark artifacts
       uses: actions/upload-artifact@v4
@@ -70,6 +80,7 @@ jobs:
         path: |
           benchmark_output.log
           target/shadow_bench/hdr_histogram.hdr
+          target/shadow_bench/histogram_summary.json
         retention-days: 30
     
     - name: Display summary

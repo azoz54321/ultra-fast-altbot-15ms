@@ -1,7 +1,8 @@
+use crate::data_feed::TradeTick;
+use arc_swap::ArcSwap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use arc_swap::ArcSwap;
-use crate::data_feed::TradeTick;
 
 /// Price snapshot for a symbol (60-second window)
 #[derive(Debug, Clone)]
@@ -12,8 +13,12 @@ pub struct PriceSnapshot {
     write_idx: usize,
     /// Number of valid entries
     count: usize,
-    /// Window duration in milliseconds
+    /// Window duration in milliseconds (60s)
     window_ms: u64,
+    /// 15-minute aggregate return (computed off hot-path)
+    ret_15m: Option<f64>,
+    /// 1-hour aggregate return (computed off hot-path)
+    ret_1h: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -27,10 +32,18 @@ impl PriceSnapshot {
     pub fn new(window_secs: u64) -> Self {
         let capacity = (window_secs * 100) as usize; // Assume max 100 ticks/sec
         Self {
-            prices: vec![PricePoint { px_e8: 0, ts_unix_ms: 0 }; capacity],
+            prices: vec![
+                PricePoint {
+                    px_e8: 0,
+                    ts_unix_ms: 0
+                };
+                capacity
+            ],
             write_idx: 0,
             count: 0,
             window_ms: window_secs * 1000,
+            ret_15m: None,
+            ret_1h: None,
         }
     }
 
@@ -43,27 +56,31 @@ impl PriceSnapshot {
         }
     }
 
-    /// Compute 60-second return (hot-path read-only)
+    /// Compute 60-second return (hot-path read-only, zero allocations)
     pub fn compute_return_60s(&self, current_ts_ms: u64) -> Option<f64> {
         if self.count < 2 {
             return None;
         }
 
-        // Find oldest valid price within window
+        // Find oldest and newest valid prices within 60s window
         let cutoff_ts = current_ts_ms.saturating_sub(self.window_ms);
         let mut oldest_price: Option<u64> = None;
+        let mut oldest_ts = u64::MAX;
         let mut newest_price: Option<u64> = None;
+        let mut newest_ts = 0u64;
 
-        // Scan ring buffer for valid prices
+        // Scan ring buffer for valid prices (no allocations)
         for i in 0..self.count {
             let point = &self.prices[i];
             if point.ts_unix_ms >= cutoff_ts {
-                if oldest_price.is_none() || point.ts_unix_ms < newest_price.unwrap_or(u64::MAX) {
-                    if oldest_price.is_none() {
-                        oldest_price = Some(point.px_e8);
-                    }
+                // Track oldest price in window
+                if point.ts_unix_ms < oldest_ts {
+                    oldest_ts = point.ts_unix_ms;
+                    oldest_price = Some(point.px_e8);
                 }
-                if newest_price.is_none() || point.ts_unix_ms > cutoff_ts {
+                // Track newest price in window
+                if point.ts_unix_ms > newest_ts {
+                    newest_ts = point.ts_unix_ms;
                     newest_price = Some(point.px_e8);
                 }
             }
@@ -77,6 +94,60 @@ impl PriceSnapshot {
         }
 
         None
+    }
+
+    /// Compute return over a longer window (off hot-path)
+    fn compute_return_window(&self, window_secs: u64, current_ts_ms: u64) -> Option<f64> {
+        if self.count < 2 {
+            return None;
+        }
+
+        let cutoff_ts = current_ts_ms.saturating_sub(window_secs * 1000);
+        let mut oldest_price: Option<u64> = None;
+        let mut oldest_ts = u64::MAX;
+        let mut newest_price: Option<u64> = None;
+        let mut newest_ts = 0u64;
+
+        for i in 0..self.count {
+            let point = &self.prices[i];
+            if point.ts_unix_ms >= cutoff_ts {
+                if point.ts_unix_ms < oldest_ts {
+                    oldest_ts = point.ts_unix_ms;
+                    oldest_price = Some(point.px_e8);
+                }
+                if point.ts_unix_ms > newest_ts {
+                    newest_ts = point.ts_unix_ms;
+                    newest_price = Some(point.px_e8);
+                }
+            }
+        }
+
+        if let (Some(old_px), Some(new_px)) = (oldest_price, newest_price) {
+            if old_px > 0 {
+                let ret = ((new_px as f64 - old_px as f64) / old_px as f64) * 100.0;
+                return Some(ret);
+            }
+        }
+
+        None
+    }
+
+    /// Update aggregate returns (15m and 1h) - called off hot-path
+    pub fn update_aggregates(&mut self, current_ts_ms: u64) {
+        self.ret_15m = self.compute_return_window(15 * 60, current_ts_ms);
+        self.ret_1h = self.compute_return_window(60 * 60, current_ts_ms);
+    }
+
+    /// Get 15-minute return (precomputed, hot-path safe)
+    #[allow(dead_code)]
+    pub fn get_return_15m(&self) -> Option<f64> {
+        self.ret_15m
+    }
+
+    /// Get 1-hour return (precomputed, hot-path safe)
+    #[allow(dead_code)]
+    pub fn get_return_1h(&self) -> Option<f64> {
+        self.ret_1h
     }
 }
 
@@ -92,8 +163,8 @@ pub struct TriggerEvent {
 
 /// Hot-path processor for tick-to-trigger logic
 pub struct HotPath {
-    /// Global flag to enable/disable buying
-    can_buy: bool,
+    /// Global flag to enable/disable buying (atomic for lock-free access)
+    can_buy: Arc<AtomicBool>,
     /// Return threshold for triggering
     threshold_pct: f64,
     /// Price snapshots per symbol (Arc-swapped for lock-free reads)
@@ -110,7 +181,7 @@ impl HotPath {
             .collect();
 
         Self {
-            can_buy: true,
+            can_buy: Arc::new(AtomicBool::new(true)),
             threshold_pct,
             snapshots,
             max_symbols,
@@ -127,16 +198,17 @@ impl HotPath {
         }
     }
 
-    /// Process a tick on the hot-path (zero allocations)
+    /// Process a tick on the hot-path (zero allocations, single-threaded)
     pub fn process_tick(&self, tick: &TradeTick) -> Option<TriggerEvent> {
-        if !self.can_buy || (tick.symbol_id as usize) >= self.max_symbols {
+        // Check can_buy flag (atomic load, relaxed ordering for performance)
+        if !self.can_buy.load(Ordering::Relaxed) || (tick.symbol_id as usize) >= self.max_symbols {
             return None;
         }
 
-        // Load snapshot (lock-free read via arc-swap)
+        // Load snapshot (lock-free read via arc-swap, immutable snapshot)
         let snapshot = self.snapshots[tick.symbol_id as usize].load();
 
-        // Compute 60s return
+        // Compute 60s return (no allocations, read-only operation)
         if let Some(ret_60s) = snapshot.compute_return_60s(tick.ts_unix_ms) {
             // Check trigger condition
             if ret_60s >= self.threshold_pct {
@@ -152,10 +224,25 @@ impl HotPath {
         None
     }
 
-    /// Set global can_buy flag
+    /// Set global can_buy flag (atomic store, can be called from risk/gate task)
+    pub fn set_can_buy(&self, can_buy: bool) {
+        self.can_buy.store(can_buy, Ordering::Relaxed);
+    }
+
+    /// Get can_buy status
     #[allow(dead_code)]
-    pub fn set_can_buy(&mut self, can_buy: bool) {
-        self.can_buy = can_buy;
+    pub fn get_can_buy(&self) -> bool {
+        self.can_buy.load(Ordering::Relaxed)
+    }
+
+    /// Update aggregates for a symbol (off hot-path maintenance task)
+    pub fn update_aggregates(&self, symbol_id: u32, current_ts_ms: u64) {
+        if (symbol_id as usize) < self.max_symbols {
+            let current = self.snapshots[symbol_id as usize].load();
+            let mut new_snapshot = (**current).clone();
+            new_snapshot.update_aggregates(current_ts_ms);
+            self.snapshots[symbol_id as usize].store(Arc::new(new_snapshot));
+        }
     }
 }
 
